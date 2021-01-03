@@ -1,0 +1,30 @@
+rules:
+  - name: dijnet
+    properties:
+      - erste_comment
+    matcher:
+      - place: ".*DIJNET.*"
+    actions:
+      update:
+        Dátum: "{comment_date}"
+        Megnevezés: dijnet
+        Kategória: rezsi
+  - name: tejes
+    properties:
+      - erste_comment
+    matcher:
+      - place: ".*FUCHS.*"
+    actions:
+      update:
+        Dátum: "{comment_date}"
+        Megnevezés: fuchs tej
+        Kategória: tejtermekek
+  - name: fundamenta
+    matcher:
+      - comment: "ajanlatszam *"
+    actions:
+      create:
+        ...
+      update:
+        Megnevezés: fundamenta
+        Kategória: megtakaritas
