@@ -93,7 +93,10 @@ def rule_matcher(matchers, params):
     return all(map(check_matcher, matchers))
 
 
-def apply_rule(rule: dict, row: pd.Series):
+def apply_rule(group: pd.DataFrame, rule: dict):
+    # waiting for one line DF's from groupby apply calls
+    assert len(group.index) == 1
+    row = group.iloc[0]
     name = rule['name']
     logger.debug(f"Checking rule {name}")
 
@@ -101,22 +104,30 @@ def apply_rule(rule: dict, row: pd.Series):
         params = rule_params(rule.get('properties', None), row)
     except ValueError as e:
         logger.error(e)
-        return row
+        return pd.DataFrame([row, ])
 
     matching = rule_matcher(rule['matcher'], params)
 
     if not matching:
-        return row
+        return pd.DataFrame([row, ])
 
-    for row_name, row_content in rule["modifications"].items():
-        row[row_name] = row_content.format(**params)
-    return row
+    rows = [row, ]
+    for current_row in rows:
+        for action_type, action_body in rule['actions'].items():
+            if action_type == "create":
+                pass
+            elif action_type == "update":
+                for row_name, row_content in action_body.items():
+                   current_row[row_name] = row_content.format(**params)
+    return pd.DataFrame(rows)
 
 
-def row_categorizer(row: pd.Series, rules: list):
+def row_categorizer(group: pd.DataFrame, rules: list):
     for rule in rules:
-        row = apply_rule(rule, row)
-    return row
+        group['temp_uid'] = range(1, len(group.index)+1)
+        group = group.groupby('temp_uid', group_keys=False).apply(apply_rule, rule=rule)
+        group.drop('temp_uid', axis=1)
+    return group
 
 
 def load_rules(rule_file):
@@ -129,7 +140,10 @@ def load_rules(rule_file):
         raise ValueError(
             "Invalid rule structure. Must containe a 'rule' root element")
 
-    return rule_list
+    active_rules = list(filter(lambda r: ('active' not in r) or r['active'], rule_list))
+    logger.info(f"Found {len(active_rules)} active rule(s)")
+
+    return active_rules
 
 
 def categorzier(file, rules):
@@ -140,8 +154,13 @@ def categorzier(file, rules):
     rules = load_rules(rules)
     logger.info(f"Loaded {len(rules)} rule(s)")
 
-    row_updater = partial(row_categorizer, rules=rules)
-    table = table.apply(row_updater, axis=1)
+    # add a unique id for every row to make sure that group by will
+    # not merge any row. We just need to use the apply method for every row
+    table['unique_id'] = range(1, len(table.index)+1)
+    # use groupby so with apply we can add new rows if create action fired
+    table = table.groupby('unique_id', group_keys=False).apply(row_categorizer, rules=rules)
+    # we dont need any more the unique id column
+    table.drop('unique_id', axis=1)
     print(table)
 
 
