@@ -20,6 +20,10 @@ from functools import reduce, partial
 import re
 import datetime
 import yaml
+import contextlib
+import random
+import string
+
 
 
 logger = logging.getLogger("hu.csomaati."+__name__)
@@ -45,6 +49,42 @@ DATE = "Dátum"
 
 ERSTE_COMMENT = "erste_comment"
 
+def rnd(length):
+    # Random string with the combination of lower and upper case
+    letters = string.ascii_letters
+    result_str = ''.join(random.choice(letters) for i in range(length))
+    return result_str
+
+def extend(df: pd.DataFrame, *args, **kwargs):
+    row_name = rnd(8)
+    df[row_name] = range(1, len(df.index)+1)
+    try:
+        df = df.groupby(row_name).apply(*args, **kwargs)
+    finally:
+        df.drop(row_name, axis=1, inplace=True)
+    return df
+
+def action_update(group, action, properties):
+    # waiting for one line DF's from groupby apply calls
+    assert len(group.index) == 1
+    row = group.iloc[0].copy()
+    for row_name, row_content in action.items():
+        row[row_name] = row_content.format(**properties)
+    new_df = pd.DataFrame([row,])
+    return new_df
+
+ACTIONS = {
+    'update': action_update,
+}
+
+
+def action_route(action_type):
+    try:
+      action = ACTIONS[action_type]
+    except KeyError:
+        logger.warning(f"There is no defined action for type {action_type}")
+        raise ValueError("Skipping row")
+    return action
 
 def check_matching(params, matcher):
     if len(matcher) != 1:
@@ -79,54 +119,61 @@ param_map = {
     "erste_comment": get_erste_comment_params
 }
 
+def build_properties(properties: list, row: pd.Series):
+    properties = [] if not properties else properties[:]
+    properties.insert(0, 'default')
+    logger.debug(f"Building properties for the following required properties {properties}")
+    try:
+      built_properties = map(lambda prop_name: param_map[prop_name](row), properties)
+    except (KeyError, ValueError) as e:
+        logger.warning(f"Cannot generate all requested properties. Skipping this row!")
+        logger.error(e)
+        raise ValueError("Skipping row")
+    merged_properties = reduce(lambda x, y: {**x, **y}, built_properties, {})
+    logger.debug(f"Merged properties: {merged_properties}")
+    return merged_properties
 
-def rule_params(required_params: list, row: pd.Series):
-    params = param_map['default'](row)
-    required_params = required_params if required_params else []
-    for required_param in required_params:
-        params.update(param_map[required_param](row))
-    return params
-
-
-def rule_matcher(matchers, params):
-    check_matcher = partial(check_matching, params)
+def check_rule(matchers: list, properties: dict):
+    check_matcher = partial(check_matching, properties)
     return all(map(check_matcher, matchers))
 
-
-def apply_rule(group: pd.DataFrame, rule: dict):
+def row_checker(group: pd.DataFrame, rule:dict):
+    group = group.copy()
     # waiting for one line DF's from groupby apply calls
     assert len(group.index) == 1
     row = group.iloc[0]
-    name = rule['name']
-    logger.debug(f"Checking rule {name}")
+    logger.debug(f"Checking rule {rule['name']}")
+
+    original_group = group.copy()
 
     try:
-        params = rule_params(rule.get('properties', None), row)
-    except ValueError as e:
-        logger.error(e)
-        return pd.DataFrame([row, ])
+      properties = build_properties(rule.get('properties', None), row)
+    except ValueError:
+        logger.warning("Cannot build required properties, skipping row!")
+        return original_group
 
-    matching = rule_matcher(rule['matcher'], params)
+    matched = check_rule(rule['matchers'], properties)
 
-    if not matching:
-        return pd.DataFrame([row, ])
+    if not matched:
+        return original_group
 
-    rows = [row, ]
-    for current_row in rows:
-        for action_type, action_body in rule['actions'].items():
-            if action_type == "create":
-                pass
-            elif action_type == "update":
-                for row_name, row_content in action_body.items():
-                   current_row[row_name] = row_content.format(**params)
-    return pd.DataFrame(rows)
+    actions = rule['actions']
 
+    try:
+      for action_type, action in actions.items():
+          action_fn = action_route(action_type)
+          group = extend(group, action_fn, action, properties)
+    except ValueError:
+        logger.warning("Cannot apply every action, skipping row!")
+        return original_group
+    
+    return group
+    
 
 def row_categorizer(group: pd.DataFrame, rules: list):
+    group = group.copy()
     for rule in rules:
-        group['temp_uid'] = range(1, len(group.index)+1)
-        group = group.groupby('temp_uid', group_keys=False).apply(apply_rule, rule=rule)
-        group.drop('temp_uid', axis=1)
+        group = extend(group, row_checker, rule=rule)
     return group
 
 
@@ -146,21 +193,16 @@ def load_rules(rule_file):
     return active_rules
 
 
-def categorzier(file, rules):
+def categorizer(file, rules_path):
     logger.info(f"Loading expenses from {file}")
     table = pd.read_csv(file)
     logger.info(f"Loaded {len(table)} line(s)")
 
-    rules = load_rules(rules)
+    rules = load_rules(rules_path)
     logger.info(f"Loaded {len(rules)} rule(s)")
 
-    # add a unique id for every row to make sure that group by will
-    # not merge any row. We just need to use the apply method for every row
-    table['unique_id'] = range(1, len(table.index)+1)
-    # use groupby so with apply we can add new rows if create action fired
-    table = table.groupby('unique_id', group_keys=False).apply(row_categorizer, rules=rules)
-    # we dont need any more the unique id column
-    table.drop('unique_id', axis=1)
+    table = extend(table, row_categorizer, rules=rules)
+
     print(table)
 
 
@@ -176,7 +218,7 @@ def main(doc=None, argv=None):
     else:
         logger.setLevel(logging.WARNING)
 
-    categorzier(file=arguments["--file"], rules=arguments["--rules"])
+    categorizer(file=arguments["--file"], rules_path=arguments["--rules"])
 
 
 if __name__ == "__main__":
