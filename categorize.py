@@ -23,6 +23,7 @@ import yaml
 import contextlib
 import random
 import string
+import functools
 
 
 
@@ -55,20 +56,27 @@ def rnd(length):
     result_str = ''.join(random.choice(letters) for i in range(length))
     return result_str
 
-def extend(df: pd.DataFrame, *args, **kwargs):
-    row_name = rnd(8)
-    df[row_name] = range(1, len(df.index)+1)
-    try:
-        df = df.groupby(row_name).apply(*args, **kwargs)
-    finally:
-        df.drop(row_name, axis=1, inplace=True)
-    return df
+def extendable(func):
+    @functools.wraps(func)
+    def wrap_extend(df: pd.DataFrame, *args, **kwargs):
+      row_name = rnd(8)
+      df[row_name] = range(1, len(df.index)+1)
+      try:
+          groups = df.groupby(row_name, group_keys=False)
+          df = groups.apply(func, *args, **kwargs)
+      finally:
+          df.drop(row_name, axis=1, inplace=True)
+      return df
 
+    return wrap_extend
+
+@extendable
 def action_update(group, action, properties):
     # waiting for one line DF's from groupby apply calls
     assert len(group.index) == 1
     row = group.iloc[0].copy()
     for row_name, row_content in action.items():
+        if row_name not in row: continue
         row[row_name] = row_content.format(**properties)
     new_df = pd.DataFrame([row,])
     return new_df
@@ -89,7 +97,7 @@ def action_route(action_type):
 def check_matching(params, matcher):
     if len(matcher) != 1:
         raise ValueError(
-            "Invalid structure for matcher. One k:v pair allowed/matcher element")
+            "Invalid structure for matcher. One k:v pair allowed per matcher element")
     k, v = list(matcher.items())[0]
     try:
         return re.match(v, params[k])
@@ -99,7 +107,6 @@ def check_matching(params, matcher):
 
 def get_default_params(row: pd.Series):
     return row.to_dict()
-
 
 def get_erste_comment_params(row: pd.Series):
     comment = row[COMMENT]
@@ -120,11 +127,11 @@ param_map = {
 }
 
 def build_properties(properties: list, row: pd.Series):
-    properties = [] if not properties else properties[:]
-    properties.insert(0, 'default')
+    if 'default' not in properties: properties.insert(0, 'default')
     logger.debug(f"Building properties for the following required properties {properties}")
     try:
-      built_properties = map(lambda prop_name: param_map[prop_name](row), properties)
+        def prop_func(name): return param_map[name](row)
+        built_properties = map(prop_func, properties)
     except (KeyError, ValueError) as e:
         logger.warning(f"Cannot generate all requested properties. Skipping this row!")
         logger.error(e)
@@ -137,22 +144,23 @@ def check_rule(matchers: list, properties: dict):
     check_matcher = partial(check_matching, properties)
     return all(map(check_matcher, matchers))
 
-def row_checker(group: pd.DataFrame, rule:dict):
-    group = group.copy()
+@extendable
+def row_apply_rule(group: pd.DataFrame, rule:dict):
     # waiting for one line DF's from groupby apply calls
     assert len(group.index) == 1
-    row = group.iloc[0]
-    logger.debug(f"Checking rule {rule['name']}")
+    group = group.copy()
+    row = group.iloc[0].copy()
 
     original_group = group.copy()
 
     try:
-      properties = build_properties(rule.get('properties', None), row)
+        required_properties = rule.get('properties', [])[:]
+        properties = build_properties(required_properties, row)
     except ValueError:
-        logger.warning("Cannot build required properties, skipping row!")
+        logger.warning(f"Cannot build required properties, skipping row {row.index}!")
         return original_group
 
-    matched = check_rule(rule['matchers'], properties)
+    matched = check_rule(rule.get('matchers', []), properties)
 
     if not matched:
         return original_group
@@ -160,21 +168,26 @@ def row_checker(group: pd.DataFrame, rule:dict):
     actions = rule['actions']
 
     try:
-      for action_type, action in actions.items():
-          action_fn = action_route(action_type)
-          group = extend(group, action_fn, action, properties)
+        def reducer(_group, _action):
+            action_fn = action_route(_action[0])
+            new_group = action_fn(_group, _action[1], properties)
+            return new_group
+
+        new_group = reduce(reducer, actions.items(), group)
     except ValueError:
         logger.warning("Cannot apply every action, skipping row!")
         return original_group
     
-    return group
+    return new_group
     
 
-def row_categorizer(group: pd.DataFrame, rules: list):
-    group = group.copy()
-    for rule in rules:
-        group = extend(group, row_checker, rule=rule)
-    return group
+def rule_applier(table: pd.DataFrame, rules: list):
+    def reducer(_table, _rule):
+        logger.info(f"Applying rule {_rule['name']}")
+        # apply a rule on a group and return with the new group
+        return row_apply_rule(_table, _rule)
+    new_table = reduce(reducer, rules, table)
+    return new_table
 
 
 def load_rules(rule_file):
@@ -188,35 +201,40 @@ def load_rules(rule_file):
             "Invalid rule structure. Must containe a 'rule' root element")
 
     active_rules = list(filter(lambda r: ('active' not in r) or r['active'], rule_list))
-    logger.info(f"Found {len(active_rules)} active rule(s)")
+    logger.debug(f"Found {len(active_rules)} active rule(s)")
 
     return active_rules
 
 
 def categorizer(file, rules_path):
     logger.info(f"Loading expenses from {file}")
-    table = pd.read_csv(file)
+    table = pd.read_csv(file)    
     logger.info(f"Loaded {len(table)} line(s)")
 
+    logger.info(f"Loading rules from {rules_path}")
     rules = load_rules(rules_path)
     logger.info(f"Loaded {len(rules)} rule(s)")
 
-    table = extend(table, row_categorizer, rules=rules)
+    table = rule_applier(table, rules)
 
     print(table)
 
+def get_loglevel(arguments):
+    level = logging.WARNING
+    if(arguments["--quiet"]):
+        level = logging.ERROR
+    elif(arguments["--verbose"]):
+        level =  logging.DEBUG
+
+    return level
 
 def main(doc=None, argv=None):
     doc = __doc__ if not doc else doc
     argv = sys.argv[1:] if not argv else argv
     arguments = docopt(doc, argv, version='Expense Categorizer 0.1')
-
-    if(arguments["--quiet"]):
-        logger.setLevel(logging.ERROR)
-    elif(arguments["--verbose"]):
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.WARNING)
+    
+    log_level = get_loglevel(arguments)
+    logger.setLevel(log_level)
 
     categorizer(file=arguments["--file"], rules_path=arguments["--rules"])
 

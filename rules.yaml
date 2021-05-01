@@ -1,8 +1,19 @@
 rules:
-  - name: dijnet
+  - name: deichmann
+    active: true
+    matchers:
+      - Megnevezés: "Piac"
     properties:
       - erste_comment
-    matcher:
+    actions:
+      update:
+        Típus: NEMTUDOM
+  - name: dijnet
+    active: false
+    # optional
+    properties:
+      - erste_comment
+    matchers:
       - place: ".*DIJNET.*"
     actions:
       update:
@@ -10,9 +21,10 @@ rules:
         Megnevezés: dijnet
         Kategória: rezsi
   - name: tejes
+    active: false
     properties:
       - erste_comment
-    matcher:
+    matchers:
       - place: ".*FUCHS.*"
     actions:
       update:
@@ -20,11 +32,9 @@ rules:
         Megnevezés: fuchs tej
         Kategória: tejtermekek
   - name: fundamenta
-    matcher:
+    matchers:
       - comment: "ajanlatszam *"
     actions:
-      create:
-        ...
       update:
         Megnevezés: fundamenta
         Kategória: megtakaritas
