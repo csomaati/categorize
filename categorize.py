@@ -18,68 +18,18 @@ from docopt import docopt
 import logging
 from functools import reduce, partial
 import re
-import datetime
 import yaml
-import contextlib
-import random
-import string
-import functools
 
-
+import pandas_extensions
 
 logger = logging.getLogger("hu.csomaati."+__name__)
 
-comment_re = re.compile(r"(?P<card>\S+)\s+"  # card id string
-                        # An optional id. Not always presented but always(?) contains a number. Its length may vary
-                        r"(?:(?P<id>(?:\S*[0-9]\S*))\s+)?"
-                        # The place of purchase. Usually a string to identify the other pary (e.g the name of the shop)
-                        r"(?P<place>.+)"
-                        # purchase date in the format YYMMDDHH:MM
-                        r"(?P<date>[0-9]{2}[0-9]{2}[0-9]{2})(?P<time>[0-9]{2}:[0-9]{2})\s+"
-                        # some optional string. Seen only on currency change and its value was .00 Have no ide what it is
-                        r"(.+)?"
-                        # some static string. Looks like always presented
-                        r"vásár\.\s*"
-                        # exchange infomation. Optional. Presented only when currency exchange was involved
-                        r"(?P<exchange>(?P<amount>\S+)\s+(?P<currency>\S+)\s+(?P<rate>\S+))?",
-                        re.UNICODE)
 COMMENT = "Jegyzet"
 PARTY = "Megnevezés"
 CATEGORY = "Kategória"
 DATE = "Dátum"
 
 ERSTE_COMMENT = "erste_comment"
-
-def rnd(length):
-    # Random string with the combination of lower and upper case
-    letters = string.ascii_letters
-    result_str = ''.join(random.choice(letters) for i in range(length))
-    return result_str
-
-def extendable(func):
-    @functools.wraps(func)
-    def wrap_extend(df: pd.DataFrame, *args, **kwargs):
-      row_name = rnd(8)
-      df[row_name] = range(1, len(df.index)+1)
-      try:
-          groups = df.groupby(row_name, group_keys=False)
-          df = groups.apply(func, *args, **kwargs)
-      finally:
-          df.drop(row_name, axis=1, inplace=True)
-      return df
-
-    return wrap_extend
-
-@extendable
-def action_update(group, action, properties):
-    # waiting for one line DF's from groupby apply calls
-    assert len(group.index) == 1
-    row = group.iloc[0].copy()
-    for row_name, row_content in action.items():
-        if row_name not in row: continue
-        row[row_name] = row_content.format(**properties)
-    new_df = pd.DataFrame([row,])
-    return new_df
 
 ACTIONS = {
     'update': action_update,
@@ -104,23 +54,6 @@ def check_matching(params, matcher):
     except KeyError:
         return False
 
-
-def get_default_params(row: pd.Series):
-    return row.to_dict()
-
-def get_erste_comment_params(row: pd.Series):
-    comment = row[COMMENT]
-    if pd.isna(comment):
-        return {}
-    match = comment_re.match(comment)
-    if not match:
-        raise ValueError(f"Invalid erste comment: {comment}")
-    params = match.groupdict()
-    params['comment_date'] = datetime.datetime.strptime(
-        match['date']+match["time"], '%y%m%d%H:%M').strftime("%Y-%m-%d %H:%M")
-    return params
-
-
 param_map = {
     "default": get_default_params,
     "erste_comment": get_erste_comment_params
@@ -144,7 +77,7 @@ def check_rule(matchers: list, properties: dict):
     check_matcher = partial(check_matching, properties)
     return all(map(check_matcher, matchers))
 
-@extendable
+@pandas_extensions.extendable
 def row_apply_rule(group: pd.DataFrame, rule:dict):
     # waiting for one line DF's from groupby apply calls
     assert len(group.index) == 1
